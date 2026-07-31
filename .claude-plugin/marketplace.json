@@ -1,0 +1,37 @@
+{
+  "name": "powerbi-migration-collection",
+  "metadata": {
+    "description": "Reusable Power BI semantic-model skills for GitHub Copilot CLI",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Guust Franssens"
+  },
+  "plugins": [
+    {
+      "name": "powerbi-migration-skills",
+      "source": "./plugins/powerbi-migration-skills",
+      "description": "Make a Power BI semantic model AI-ready and persist a refreshed local PBIP. Descriptions, enumerated domains, model-level AI instructions (CustomInstructions) and the qnaEnabled switch that silently voids them; plus refreshing a PBIP in Power BI Desktop and saving it headlessly to cache.abf via AMO ImageSave. Source-tool agnostic - the input is already a Power BI model - so it applies to Tableau, Qlik and Cognos migrations alike.",
+      "version": "0.1.0",
+      "skills": [
+        "./skills/powerbi-ai-readiness",
+        "./skills/pbip-model-refresh"
+      ],
+      "agents": [],
+      "repository": "https://github.com/Guust-Franssens/powerbi-migration-skills",
+      "keywords": [
+        "powerbi",
+        "power-bi",
+        "semantic-model",
+        "tmdl",
+        "pbip",
+        "copilot",
+        "ai-readiness",
+        "migration",
+        "tableau",
+        "fabric"
+      ],
+      "license": "MIT"
+    }
+  ]
+}
