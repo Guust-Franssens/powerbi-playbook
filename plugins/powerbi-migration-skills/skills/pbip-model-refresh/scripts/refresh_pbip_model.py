@@ -83,6 +83,10 @@ from probe_desktop_query import AUTO_DATE_TABLE_PREFIXES, _load_adomd, discover_
 
 SAVE_SETTLE_SECONDS = 3
 SAVE_TIMEOUT_SECONDS = 120
+# Bounded so a missing credential fails FAST instead of hanging on an invisible sign-in modal.
+# 90s is comfortably above a serverless warehouse cold start (~30-60s) and far below the "agent
+# looks busy but is permanently stuck" territory that made this necessary.
+REFRESH_TIMEOUT_SECONDS = 90
 
 # A TMDL table declaration sits at column 0 of `definition/tables/<Name>.tmdl`; the name is quoted
 # only when it needs to be (spaces, punctuation), so both forms have to be accepted.
@@ -102,11 +106,32 @@ def _catalog_id(conn) -> str:
         reader.Close()
 
 
-def refresh(port: int, tables: list[str] | None) -> tuple[bool, str]:
+def refresh(port: int, tables: list[str] | None, timeout_sec: int = REFRESH_TIMEOUT_SECONDS) -> tuple[bool, str]:
     """Send a TMSL refresh over XMLA. Returns (ok, message).
 
     Refreshing named tables is preferred over the whole database: a full refresh can hang for
     minutes on a large table that no report even uses.
+
+    **The timeout is real, but it does NOT bound the case it was added for.** Measured 2026-08-01,
+    both halves, each with the timeout verified on readback:
+
+    - ✅ It works at the XMLA layer. An expensive `EVALUATE` under `CommandTimeout = 1` / `5` raised
+      `AdomdErrorResponseException: The XML for Analysis request timed out ... Timeout value: N sec`
+      after 1.2 s / 6.0 s. Honoured, and precisely.
+    - ❌ It does not interrupt a credential wait. A one-table refresh against a Databricks source with
+      no cached credential, `CommandTimeout = 45`, ran **past 150 s** (hard wall-clock guard hit, call
+      never returned). Desktop stayed `Responding` throughout and no `cache.abf` was written.
+      ⚠️ Inferred mechanism: the mashup engine parks in a synchronous wait on a UI dialog in another
+      process, which the server cannot preempt the way it aborts a running query.
+
+    So it cuts short a source that is merely *slow*, and never one that is waiting on a human.
+    **The caller must run its own clock** — that agent-side "~2 minutes then stop and ask" rule is the
+    only thing that actually bounds this.
+
+    Historical note, because it nearly went in the other direction: an earlier attempt to measure this
+    was run against the *stale plugin copy* of this file, which had no timeout at all. It "ran past
+    90 s" because there was no 90. Never take a timing measurement against a bundle preflight reports
+    as STALE.
     """
     adomd_connection = _load_adomd()
     conn = adomd_connection(f"Data Source=localhost:{port}")
@@ -120,6 +145,7 @@ def refresh(port: int, tables: list[str] | None) -> tuple[bool, str]:
         tmsl = json.dumps({"refresh": {"type": "full", "objects": objects}})
         cmd = conn.CreateCommand()
         cmd.CommandText = tmsl
+        cmd.CommandTimeout = timeout_sec
         cmd.ExecuteNonQuery()
         return True, f"refreshed {'/'.join(tables) if tables else 'entire database'} (catalog {catalog})"
     finally:
@@ -398,7 +424,21 @@ def _refresh_and_save(pid: int, port: int, cache: Path | None, args: argparse.Na
     try:
         ok, message = refresh(port, args.tables)
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        print(f"REFRESH: ERROR {type(exc).__name__}: {exc}")
+        text = f"{type(exc).__name__}: {exc}"
+        # A timeout here is almost always a credential modal Desktop is showing but the agent cannot
+        # see. Say so explicitly and name the human action, rather than emitting a bare stack trace
+        # that reads like a transient glitch worth retrying. Retrying cannot dismiss a sign-in dialog.
+        if "timeout" in text.lower() or "timed out" in text.lower():
+            print(f"REFRESH: NO_DATA - refresh timed out after {REFRESH_TIMEOUT_SECONDS}s ({text})")
+            print(
+                "  LIKELY CAUSE: Power BI Desktop is showing a data-source sign-in modal that no\n"
+                "  automation can fill. Confirm with:\n"
+                f"    powershell -File scripts/probe_desktop_credential.ps1 -DesktopPid {pid}\n"
+                "  THIS NEEDS A HUMAN. Do not retry, and do not proceed to a full build: ask the user\n"
+                "  to sign in to the source once in Desktop, or to authorize an unvalidated build."
+            )
+            return 3
+        print(f"REFRESH: ERROR {text}")
         return 2
     print(f"  refresh: {message}" if ok else f"  refresh FAILED: {message}")
 
