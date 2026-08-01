@@ -13,6 +13,10 @@ sufficient**. It passes structurally-valid-but-wrong encodings, and it **silentl
 checks** when it cannot fetch the visualContainer schema (`PBIR_SCHEMA_UNREACHABLE` — it still prints
 "0 errors"). Only a live Desktop render catches the class of bug in §1.
 
+**Treat `PBIR_SCHEMA_UNREACHABLE` as "schema validation did NOT run."** The declared `2.11.0` schema
+404s; `2.9.0` is the newest published. Confirm instead with a Desktop open-test (a schema violation
+raises an error dialog on open) or an offline `ajv` harness against the real 2.9.0-family schemas.
+
 > **Scope note:** the mechanisms here are pure Power BI, so this folder ports to a Qlik or Cognos
 > migration unchanged. A handful of entries name the source-tool idiom that led to the discovery
 > (Tableau shelves, `MAKELINE`); read those as examples, not as prerequisites. Cross-references to
@@ -28,8 +32,13 @@ These pass `validate` but render wrong. Only a live Desktop screenshot catches t
 - **azureMap `Location` role + explicit Lat/Long = a Desktop error** ("Remove Location… or set aggregate
   to Average"). Fix: keep `Location`, set Lat/Long to **Average** aggregation (lossless when the grain
   is one coordinate per point).
-- **`field.Aggregation.Function` enum: Sum=0, Avg=1, Max=2, Min=3, Count=4.** A wrong value is not a
-  field reference, so it passes validation but **silently aggregates wrong**.
+- **`field.Aggregation.Function` enum: Sum=0, Avg=1, Count=2, Min=3, Max=4.** 🟢 render-verified — a
+  5-projection `cardVisual` over a 730-row column (values 75.75–92.78) returned `0 → 61.82K` (sum),
+  `1 → 84.69` (avg), `2 → 533`, `3 → 75.75` (min), `4 → 92.78` (max). Note `2` is a **DISTINCT** count
+  (533 distinct weights out of 730 rows), not the row count — use `CountNonNull` if you want 730.
+  A wrong value is not a field reference, so it passes validation but **silently aggregates wrong**.
+  *(This corrects an earlier version of this file which claimed Max=2, Min=3, Count=4; the
+  `powerbi-report-authoring` references had it right.)*
 - **Projection-level `format` overrides** (`proj.format = "0.00%"`) and **`expansionStates`** both pass
   validation but their Desktop honouring is unconfirmed offline — `expansionStates` in particular is a
   **no-op on initial render** (matrix still shows collapsed); don't burn cycles chasing it, document a
@@ -41,6 +50,18 @@ These pass `validate` but render wrong. Only a live Desktop screenshot catches t
 - **Slicers/maps showing "Column … cannot be found or may not be used"** almost always mean a
   field-parameter table's columns didn't materialize — a **semantic-model** bug (`sourceColumn` needs
   brackets, `[Value1]`). Suspect this first for FP-bound visuals; it is not a report-layer fix.
+- **`slicer` + `data.mode = 'Single'` on a NUMERIC column silently ignores its
+  `objects.general.filter` default.** 🟢 render-verified. Desktop draws a bare text input showing the
+  column's **minimum**, not the pre-selected value — so two what-if slicers intended to load at `10`
+  and `25.0` loaded at `1` and `0.0` while `validate` reported 0 errors. This breaks the
+  "every slicer has a default" rule (§8) *without any diagnostic*. Fix: use `mode = 'Dropdown'`; the
+  **identical** `general.filter` payload then renders the right value, proving the filter encoding was
+  never the problem. Treat `'Single'` as unsafe for what-if/numeric parameter controls.
+- **A textbox that mixes a large title run and a small descriptor run in ONE paragraph wraps and
+  clips.** 🟢 render-verified. Desktop wraps the second run onto a new line, cuts it off at the box
+  bottom, and draws a stray vertical overflow mark at the right edge — `validate` says 0 errors. Fix:
+  emit **two paragraphs** (heading run, then descriptor run) and size the box for both lines; a
+  single-run wrap is not deterministic against the box width.
 
 ## 2. Data colours and conditional formatting
 

@@ -168,6 +168,32 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
 - **Ground-truth EACH table calc two independent ways in Python** (Tableau semantics via sorted-partition
   `.iloc`/`cumcount`, and a literal DAX-mechanics replica via boolean masks over the raw table) and assert
   equality per probe row — two independent codings agreeing is far stronger than restating one formula.
+- **A running total must clear EVERY date-ish column of its own table, not just the daily one** [seen,
+  LogisticsLive]. The canonical `CALCULATE(SUM(t[v]), FILTER(ALL(t[Date]), t[Date] <= MAX(t[Date])))` is
+  only correct while `t[Date]` is the axis. Put a coarser same-table column on the axis — a month-start
+  column you added so the report can reproduce a Tableau `mn`/`tmn` bin — and the surviving `t[Month]`
+  filter still restricts the fact rows, so the "running total" silently collapses to **that bucket's own
+  total**: a plausible-looking, non-cumulative line that no structural validation flags. Fix:
+  `VAR _asOf = MAX(t[Date]) RETURN CALCULATE(SUM(t[v]), FILTER(ALL(t[Date], t[Month]), t[Date] <= _asOf))`
+  — `ALL()` takes several columns of one table, and the `VAR` pins the as-of date in the outer context.
+  Measured on a 730-row table: old form returned exactly the month total for all 24 months, new form
+  accumulated to the grand total to the cent, and the two agreed on **0 of 730 days** of difference at the
+  daily grain (strict superset). Generalizes to any measure that removes a filter by naming one column.
+
+**Month/quarter binning is a MODEL job, and it lands on you mid-migration:**
+- Power BI cannot bin a date to month in the **report** layer when the model has no date table, no
+  `variation` blocks and `__PBI_TimeIntelligenceEnabled = 0` — `HierarchyLevel`/`GroupRef` are unavailable
+  and `DateSpan` is for filter `Where` conditions, not projections. So a source `mn`/`tmn` date-part shelf
+  becomes a **date-typed month-start calculated column** per table:
+  `IF(ISBLANK(t[D]), BLANK(), DATE(YEAR(t[D]), MONTH(t[D]), 1))`, `dataType: dateTime`,
+  `formatString: mmm yyyy`. Never a text label ("Jan 2022" sorts alphabetically and scrambles the axis);
+  if you do ship a label column, give it an explicit `sortByColumn`.
+- **Per-table, not a shared calendar**, when the sources were independent in the workbook (`joins: []`,
+  one source per worksheet) — a shared date dimension invents relationships the source never had and
+  changes cross-filter semantics. Two disconnected month columns are the faithful shape.
+- Note the source-tool nuance in `limitations_encountered`: Tableau's `mn` is the MONTH **date part**
+  (cycles Jan–Dec), `tmn` is the truncated month (month start). A multi-year trend line means month-start;
+  say which reading you implemented rather than letting it pass silently.
 
 **Cross-agent — the report builder needs these FROM you (decide at model-design time):**
 - **Azure Map route/great-circle maps (Tableau `MAKELINE`/`MAKEPOINT`): build an endpoint-unpivoted PATH
@@ -180,6 +206,15 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
   only render a static placeholder card for a metric that has no backing field (seen: 3 Airline tiles).
 - **Dimension-flavored Field Parameters need the `ParameterMetadata` marker**, or the report can't native-
   swap the dimension (measure-flavored FPs switch fine via `SELECTEDVALUE` wrapper measures).
+- **A re-runnable `_gen/gen_model.py` will clobber the report builder's work on your NEXT fix pass**
+  [seen, LogisticsLive]. Model generators typically also emit a one-page report *placeholder* so the
+  `.pbip` can be opened in Desktop at all. Re-run that generator for a model-only fix after
+  `pbi-report-builder` has replaced the folder, and it silently rewrites `pages.json` back to
+  `pageOrder: ["p_placeholder"]`, orphaning every built page — a cross-layer clobber no validator catches.
+  Guard the scaffold (`if a real report exists: skip`) *before* re-running, and confirm afterwards that
+  Desktop still enumerates the real pages. The same applies to `cultures/en-US.tmdl`: a generator re-run
+  resets it to a bare scaffold, so re-stamp `set_ai_instructions.py` or the model silently loses its AI
+  instructions.
 
 **Modeling at scale / fidelity:**
 - **Reconcile near-duplicate data sources by WORKSHEET BINDING, not row content** — byte-identical CSVs in
@@ -198,3 +233,112 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
   numerics visible with `summarizeBy=sum` (Tableau exposed them as draggable measures); don't "fix" it.
   The bundled `bpa.ps1` runs Tabular Editor with `-G` (silent stdout, exit 0 even on violations) — to see
   the human-readable list, run `TabularEditor.exe <def> -A <rules>` **without** `-G`.
+
+## 5. Live sources: prove reachability first, and never self-supply a credential
+
+A live-source model (Databricks, Snowflake, SQL Server, BigQuery…) is the one case where a model can
+be **structurally perfect and completely unverified**. The TMDL of a model whose warehouse was never
+contacted is byte-identical to one that refreshes fine — nothing on disk tells you which you have.
+
+### The failure this section exists to prevent (measured 2026-08-01)
+
+An agent was told to migrate a workbook with two live Databricks sources and *"treat data validation
+as deferred if it turns out you cannot reach the source."* It ran **45 minutes / 178 tool calls** and
+produced a complete, well-formed model — Databricks partitions, correct host and HTTP path, honest
+column descriptions — for a warehouse it had **never once contacted**. Proof: the SQL warehouse was
+still `STOPPED` with `num_active_sessions = 0` (a serverless warehouse auto-starts on the first real
+query), and no `.pbi/cache.abf` existed. It never came back to ask.
+
+Two distinct root causes, both worth naming:
+
+1. **The only real connectivity test lived at the END.** `preflight_source_credentials.py` is a
+   *static* read of `migration-spec.json` — it reports "this looks like a live source that will need a
+   credential" and never opens a socket. The genuine test was the handoff refresh gate, *after* the
+   whole model was built. So nothing could fail fast.
+2. **"Deferred" was read as "skip".** The agent took permission-to-continue-if-unreachable as
+   permission to never find out. Those are different: deferral is a decision made **after** a probe
+   fails, and it needs the probe result to be an informed one.
+
+### The rule
+
+**Read one row from every live source before translating a single calculation.** A ~30-second probe
+replaces a 45-minute build you would have to throw away. Order matters more than the mechanism:
+
+```bash
+python scripts/preflight_source_credentials.py --spec <spec>   # inventory only - opens NO connection
+# ... then a REAL read, before any table/measure work:
+python scripts/probe_desktop_query.py --pid <pid>              # -> PREFLIGHT: DATA_OK
+```
+
+Cheapest honest probe: author a **canary** — one table, one live partition, `Table.FirstN(…, 1)` —
+open it in Desktop, refresh, require a row. If it returns data, build for real; if it does not, you
+have your answer in seconds. Cap at **~2 minutes or 3 attempts**, then stop and ask.
+
+**Independent confirmation is available and worth taking.** For a serverless warehouse, `STOPPED` with
+`num_active_sessions = 0` proves no query ever arrived, regardless of what any log claims. Prefer
+evidence from the *source system* over the absence of an error on your side.
+
+### ⛔ Never obtain or supply the credential yourself
+
+You do not have it, and every route to getting it is a defect:
+
+| Tempting shortcut | Why it is wrong |
+|---|---|
+| Read `.databrickscfg`, `~/.aws`, env vars, a keyring | Exfiltrates a user secret into your context |
+| Reuse your own `az` / `databricks` CLI token | Builds a model **only you** can refresh; breaks for every real user |
+| Embed a PAT/key in TMDL or M | A committed secret — the worst outcome, and it survives in git history |
+| Drive Desktop's sign-in modal | The Desktop bridge cannot fill it; automating a credential UI is not yours to do |
+
+Correct M **defers to Power BI's own credential store** and names no secret at all:
+
+```
+Source = Databricks.Catalogs(DatabricksHost, DatabricksHttpPath, [Catalog=null, Database=null])
+Source = Sql.Database(ServerName, DatabaseName)
+```
+
+Your only move is to **ask** — naming the system, the server, what you tried, and the two options
+(sign in interactively in Desktop, or supply a PAT/key). A credential is the canonical thing only a
+human can provide; no amount of retrying or cleverness conjures one.
+
+### Why you cannot just run `SELECT 1` from the shell
+
+The obvious idea — "run a one-row query against the warehouse and see if it works" — tests the **wrong
+credential**, and that failure mode is worse than no test.
+
+`databricks sql`, an ODBC call, or an `az` token all authenticate as **you**, the agent's shell
+identity. Power BI does not use any of them. It uses a credential cached **per-Windows-user in
+Desktop's DPAPI store, keyed by data source**, and there is no `powerbi test-connection` verb that
+reaches it. So a shell probe can return a happy row from a warehouse Power BI still cannot open — a
+green light that means nothing. (This was exactly the setup measured 2026-08-01: the `databricks` CLI
+was fully authenticated and could query the warehouse, while Power BI had never authenticated to it at
+all.)
+
+The test must therefore go **through Power BI**, and the smallest thing Power BI can execute is a
+model. Hence: one table, `Table.FirstN(…, 1)`, refresh, require `DATA_OK`. That is the `SELECT 1` — it
+just has to be expressed as a partition rather than a shell command.
+
+**Do not build a separate throwaway "canary" PBIP for this.** That was tried and abandoned: a
+hand-authored PBIP needs five exactly-correct `$schema` URLs plus a `.platform` file, and getting any
+of them wrong makes Desktop throw a modal crash dialog that looks *identical* to an unreachable source.
+You are already building a model — build its **first table only**, refresh that, and continue only on
+`DATA_OK`. No new file-format surface, no new failure mode.
+
+### `PERSISTED` does not prove the live source loaded
+
+The hand-off gate requires `REFRESH: DATA_OK + PERSISTED`. For a **live** source that is necessary but
+not sufficient, because **a partial refresh still writes a cache**.
+
+Measured 2026-08-01: a migration with two Databricks tables plus one CSV finished with a 62 KB
+`.pbi/cache.abf` on disk — while the SQL warehouse had never left `STOPPED` with
+`num_active_sessions = 0`. The cache was real; it just held the **CSV table only**. Both live tables
+were empty. The model looked refreshed, persisted and validated, and was none of those things where it
+mattered.
+
+So for every live table, assert rows explicitly:
+
+```
+EVALUATE ROW("n", COUNTROWS('Shipment'))     -- must be non-zero, per live table
+```
+
+And prefer evidence from the **source system** when you can get it: for a serverless warehouse,
+`STOPPED` + `num_active_sessions = 0` proves no query ever arrived, whatever your own logs suggest.
