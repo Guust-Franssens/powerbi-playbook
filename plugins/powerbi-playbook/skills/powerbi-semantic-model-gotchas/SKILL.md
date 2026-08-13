@@ -111,8 +111,10 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
   time** with `Column 'CDD_0_1' cannot be found`. Whenever you rename a column for any reason, grep
   every measure/calculated-column expression that references it and update to the new `name`.
 - **Always pass an explicit culture to M type-conversion calls** (`Table.TransformColumnTypes`,
-  `Number.FromText`, `Date.FromText` — e.g. `Table.TransformColumnTypes(#"prior step", {...},
-  "en-US")`). This is cheap insurance against a real failure mode: on a machine with a non-standard
+  `Number.FromText`, `Date.FromText`) — **and make its value match the source's actual textual
+  representation, never a fixed constant and never the model's `culture`** (a hard-coded constant is
+  the exact thing that silently corrupts a legacy `.xls`; evidence and decision tree below). Passing
+  *a* culture is cheap insurance against a real failure mode: on a machine with a non-standard
   Windows regional format (e.g. language=English, region=Belgium — a "custom locale", LCID
   4096/`LOCALE_CUSTOM_UNSPECIFIED`), an XMLA-triggered refresh (`partition_operations
   RefreshWithXMLA`, or any MCP-driven refresh/commit) can fail with `'4096' locale is not supported`
@@ -123,6 +125,41 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
   **try Power BI Desktop's own UI "Refresh" button** — empirically, a UI-triggered refresh can
   succeed where an externally-issued XMLA commit fails identically, so it's worth trying before
   escalating.
+- ⚠️ **A hard-coded culture SILENTLY CORRUPTS a legacy `.xls` source** [measured,
+  book_5-1-Table-Calcs, en-BE host] — this is the concrete proof of the "match the source, not a
+  constant" half of the rule above, and it fails *silently and green*. `"en-US"` is the exact
+  constant that breaks this case.
+  - **Mechanism, proven step by step.** `Excel.Workbook(File.Contents(…), null, …)` reading a genuine
+    BIFF `.xls` (magic `D0 CF 11 E0`) returns numeric and date cells as **text**
+    (`Value.Is(sv, type text)` = `true`), and it formats that text in the **OS user locale** — *not*
+    `Culture.Current` (measured `en-US` inside the mashup engine), *not* the model's `culture` /
+    `sourceQueryCulture` (both `en-US` on disk). So `261.96` arrives as `"261,96"` and `2017-11-08` as
+    `"08/11/2017"`. A downstream `Table.TransformColumnTypes(…, "en-US")` then reads `,` as a *group*
+    separator → **26196** (a 100× inflation), and `d/m` as `m/d` → 11 Aug. Days > 12 raise a hard
+    error and are nulled by `returnErrorValuesAsNull`.
+  - **It refreshes GREEN and looks populated.** `SUM(Sales)` was **493× too large** (1,131,591,720 vs
+    2,297,200.86) and **5,952 / 9,994 dates were blank**, while integer columns with no separator
+    (`Quantity`) were untouched. `openability_selfcheck` reported `ok: true` on all six checks.
+  - **`delayTypes` is NOT the cause — hypothesis tested and refuted.** `Excel.Workbook(…, null, false)`
+    returns byte-identical text. Don't spend a cycle there.
+  - **The discriminator that proves it is ONE cause, not two bugs:** sweep candidate cultures in a probe
+    table. `en-GB` fixes the dates and still corrupts the numbers; `en-BE`/`nl-BE`/`fr-BE`/`de-DE` all
+    reproduce source truth exactly. Two symptoms, one text round-trip.
+  - **Decision tree — choose the culture by source, and prefer removing the `.xls` reader entirely:**
+    1. **Durable fix — land the sheet as `.csv`/`.xlsx` upstream** (invariant `yyyy-MM-dd` dates, `.`
+       decimals), where the values never become text and no culture can corrupt them. This is the
+       real answer; fuller treatment and the deterministic reproduction are in §6.
+    2. **Stopgap, only if you must parse the `.xls` in place — detect the OS locale at build time**
+       (`GetUserDefaultLocaleName`) and emit *that* as the parse culture (it is the locale the reader
+       used to format the text). Do **not** hard-code either `"en-US"` or `"en-BE"`. **No
+       locale-independent M fix exists**: the reader's output locale is not observable from M, and
+       `"1,234"` is genuinely ambiguous. ⚠️ This makes the emitted `.tmdl` **host-dependent** (it
+       corrupts on the next machine), so it is a stopgap, not the fix.
+- ⚠️ **A legacy `.xls` also needs a different NAVIGATION KEY, or the model cannot refresh at all**
+  [same workbook]. The `.xlsx`-shaped `Source{[Item="Orders", Kind="Sheet"]}[Data]` does not resolve
+  against a BIFF `.xls`, whose nav table has only `Name | Data` columns — there is no `Item` or `Kind`
+  column to match. Use `Source{[Name="Orders"]}[Data]`. This one at least fails loudly (refresh
+  errors outright) rather than silently, but note it *still* passed every structural check.
 - **Rediscover the Desktop AS connection after every Desktop restart.** The child
   `AnalysisServicesWorkspace` process gets a new port every time Desktop (re)starts (observed
   57025 → 59524 across one session) — never reuse a cached connection string; always re-run the
@@ -195,15 +232,106 @@ Desktop on open** — they only surface when the PBIP is actually opened, not fr
   (cycles Jan–Dec), `tmn` is the truncated month (month start). A multi-year trend line means month-start;
   say which reading you implemented rather than letting it pass silently.
 
+**`sortByColumn` IS A DEPENDENCY EDGE — so its target can never be a calculated column derived from
+the column it sorts** [measured 2026-08-08, `book_5-2-LOD`, Desktop 2.157.627.0]. Tableau sorts a
+dimension axis **DESC by a measure**; the natural translation is to rank the dimension and set
+`sortByColumn`. Written as a DAX calculated column, it **cannot load**:
+
+```
+A circular dependency was detected:
+Orders[Sub-Category], Orders[Sub-Category Sales Rank], Orders[Sub-Category].
+```
+
+The sorted column depends on its sort key, and a key that is **single-valued per category** (which a
+sort key must be) is by definition a function of that category — so it depends back. The cycle is
+**unavoidable for any DAX calculated column ranking its own column**, and rewriting the DAX does not
+escape it: dropping the direct `'Orders'[Sub-Category]` reference only routes the cycle through the
+`ALLEXCEPT` argument instead. Contrast the shape that *does* work — the emitted `Date.tmdl`, where
+`Month` sorts by `'Month No' = MONTH('Date'[Date])`: the key derives from a **different** column.
+
+**Fix: materialize the rank in Power Query so the key carries no DAX dependencies at all** — an
+ordinary source column. Strictly additive, after the verified type step:
+
+```
+SubCatTotals = Table.Group(Typed, {"Sub-Category"}, {{"SubCatSales", each List.Sum([Sales]), type number}}),
+SubCatRanked = Table.AddIndexColumn(Table.Sort(SubCatTotals, {{"SubCatSales", Order.Descending}}), "Sub-Category Sales Rank", 1, 1, Int64.Type),
+SubCatKey    = Table.RenameColumns(Table.SelectColumns(SubCatRanked, {"Sub-Category", "Sub-Category Sales Rank"}), {{"Sub-Category", "SubCatKey"}}),
+Ranked       = Table.ExpandTableColumn(Table.NestedJoin(Typed, {"Sub-Category"}, SubCatKey, {"SubCatKey"}, "SubCatJoin", JoinKind.LeftOuter), "SubCatJoin", {"Sub-Category Sales Rank"})
+```
+
+`Table.Group` guarantees one row per category, so the LEFT OUTER join is 1:1 — verify row count is
+unchanged and `COUNTROWS(SUMMARIZE(t, t[Cat], t[Rank]))` equals the distinct category count, or the
+model refuses to commit ("There can't be more than one value in the 'sort by' column…").
+
+⚠️ **This defect class is invisible to every offline check.** The calculated-column version passed
+`TmdlSerializer.DeserializeDatabaseFromFolder` (compat 1606, `SortByColumn` resolving to a real
+column object), `check_datamodel`, including M syntax and low-noise TMDL integrity assertions — and Desktop
+still refused the project. The symptom is the **`Untitled - Power BI Desktop`** window from §2, and
+the message lives in an **in-app dialog** that only a UI-Automation *descendants* scan surfaces (§5's
+recipe, filtering on `circular|depend|Issues`). Read the modal; do not infer from the title.
+
+✅ **And the payoff, also measured: a model-level sort SURVIVES small multiples where a visual-level
+sort does not.** On the same `clusteredBarChart` with `Region` in the small-multiples well, a PBIR
+`sortDefinition` was ignored (alphabetical) whether it named an off-axis measure or the on-axis
+aggregation, while the byte-identical sort with the well emptied worked. `sortByColumn` reordered all
+17 categories correctly across all 4 panes. So when a source tool sorts a small-multiples axis by a
+measure, **`sortByColumn` is the mechanism that works** — and it is the model's job, not the report's.
+
 **Cross-agent — the report builder needs these FROM you (decide at model-design time):**
 - **Azure Map route/great-circle maps (Tableau `MAKELINE`/`MAKEPOINT`): build an endpoint-unpivoted PATH
   table** (one row per endpoint, with a shared path id + point order) so the report can feed azureMap's
   `PathID`+`PointOrder` wells. Origin+destination lat/long as four columns on a single fact row **cannot**
   draw an arc — the report is then stuck with endpoint bubbles. This is a model-shape decision, not a
   report one.
+- **Azure Map POINT maps: the model owes the report a single LEAF geography column, because the
+  Location well is a DRILL HIERARCHY** [seen, `book_6-1-Maps` Superstore, 2026-08-09]. Tableau plots
+  geographic fields on Detail at the **finest** level present, so `Country / State / City` draws one
+  mark per city. Azure Maps does the opposite: *"When entering multiple values into the Location
+  field, you create a geo-hierarchy"*
+  ([learn](https://learn.microsoft.com/azure/azure-maps/power-bi-visual-geocode)) and renders the
+  **current (top)** level. Measured: `DISTINCTCOUNT('Orders'[Country]) = 1`, so 6 of 7 azureMap
+  visuals collapsed to **one mark at the US centroid** — and it renders, refreshes and validates
+  cleanly, so only a screenshot catches it. ⚠️ **The leaf must be the qualified key, not the bare
+  city**: on this 9,994-row extract `City` alone is 531 values but `(City, State)` is **604** — 57
+  city names repeat across states (4 Springfields), so `City` alone silently merges/mis-geocodes
+  **21.5%** of marks. Emit `column 'Map Location' = IF(OR(t[City]="", t[State]=""), BLANK(), t[City] &
+  ", " & t[State])` with **`dataCategory: Address`** (the free-form category — a partial address
+  geocodes to the city centroid; that doc explicitly warns against stuffing composite values into
+  `City`/`StateOrProvince`) and `summarizeBy: none`. Concatenating location fields into one mapped
+  column is first-party guidance
+  ([learn](https://learn.microsoft.com/power-bi/create-reports/desktop-tips-and-tricks-for-creating-reports#improve-geocoding-with-more-specific-locations)).
+  ⚠️ **Give the column a comma-free name** (e.g. `'Map Location'`, above). The engine *does* accept a
+  comma — verified against a live engine: TOM accepted the create, `'Orders'[City, State]` parses
+  (brackets delimit), and every table-qualified reference evaluates — so it does **not** fail. But
+  `,` is documented-invalid for table/column/measure names
+  ([DAX naming requirements](https://learn.microsoft.com/en-us/dax/dax-syntax-reference)) and works
+  only because hand-authored TMDL bypasses the validation Power BI Desktop's UI enforces: unsupported
+  territory that external tooling (Tabular Editor, BPA, downstream parsers) may reject, with no
+  guarantee it keeps working. Prefer the comma-free name and **tell the report builder the exact
+  name**. Do **not** reach for Lat/Long unless
+  the source actually has them: Tableau's `Latitude (generated)` is its geocoder's *output*, not
+  workbook data, so synthesising coordinates means importing a gazetteer the migration never had.
 - **Provision EVERY dashboard-visible metric.** If a Tableau dashboard shows a KPI tile/value, the model
   must have a backing measure or column for it — the report builder works against a *frozen* model and can
   only render a static placeholder card for a metric that has no backing field (seen: 3 Airline tiles).
+- **A city-grain bubble map needs a concatenated `Place` column FROM YOU, and it needs a comma-free
+  name** [seen, Superstore `8-1-Dashboards`]. Bing geocodes a Location field **by name**, so bare US city
+  names put Springfield/Columbus/Franklin in Europe, Africa and Australia — verified 100 % US data (1
+  country, 49 states, 531 cities) rendering across three continents. The report layer **cannot** fix this:
+  dragging `Country`/`State` in beside `City` turns the Location well into a **geo-hierarchy** that renders
+  only its top level, so a single-valued `Country` collapses every bubble into one
+  ([map tips](https://learn.microsoft.com/power-bi/visuals/power-bi-map-tips-and-tricks), tip 2). The model
+  fix is one calculated column `City & ", " & State` with **`dataCategory: Place`** (that doc's tip 4 —
+  Place is the category *for* a single column carrying full location info; the "keep `City` = `Southampton`,
+  not `Southampton, New York`" warning applies to **City**-categorized columns, so leave the original
+  `City`/`State`/`Country` categories untouched). ⚠️ **Name it without a comma** — e.g.
+  `'Map Location'` — and **tell the report builder the exact name**. (A comma *works* but is
+  documented-invalid and survives only by bypassing Desktop's UI validation, so it is unsupported
+  territory; full evidence in the azureMap point-map entry above. Don't ship `'City, State'`.) Expect
+  the **bubble count to rise** (531 → 604 here): the new column's
+  cardinality equals the distinct `(City, State)` pair count, which *matches* Tableau's own mark grain when
+  its Detail shelf carried City + State + Country — a fidelity gain, not a regression, but say so or it
+  reads as a bug.
 - **Dimension-flavored Field Parameters need the `ParameterMetadata` marker**, or the report can't native-
   swap the dimension (measure-flavored FPs switch fine via `SELECTEDVALUE` wrapper measures).
 - **A re-runnable `_gen/gen_model.py` will clobber the report builder's work on your NEXT fix pass**
@@ -410,3 +538,235 @@ exists to prevent.
 
 **Trust `powerbi-desktop status` + `currentFilePath`, never the pid `open` hands back.** Match the
 instance to your own `.pbip` path before you touch it.
+
+## 6. File-based extracts: a legacy `.xls` + a custom OS locale silently corrupts DATA
+
+Measured 2026-08-08 (`book_8-1-Dashboards`, Tableau Superstore extract landed as a legacy BIFF8
+`.xls`, machine locale **en-BE / LCID 4096** — decimal separator `,`, short date `dd/MM/yyyy`).
+
+This is the worst class of defect in this file: **the model opens, refreshes, persists, reports
+`REFRESH: DATA_OK + PERSISTED`, and passes the hand-off gate — while every decimal and every date in
+the fact table is wrong.** No structural validator can see it.
+
+**The signature** (model vs. the source file, read independently with `xlrd`):
+
+| source value | rendered by the reader (en-BE) | in the model | what happened |
+|---|---|---|---|
+| `Sales 261.96` | `"261,96"` | `26196` | `,` consumed as a **group separator** |
+| `Sales 957.5775` | `"957,5775"` | `9575775` | same, ×10⁴ |
+| `Discount 0.45` | `"0,45"` | `45` | same |
+| `Order Date 2017-11-08` | `2017-08-11` | day↔month **transposed** (silently plausible) |
+| `Order Date 2017-06-16` | *(null)* | day > 12 → invalid month → null |
+| `SUM(Sales) 2,297,200.86` | `1,131,591,720` | ~493× |
+| 0 blank dates | **5,952 / 9,994 blank** | ~60% of the fact table |
+
+**The tell that saves you:** integer and text columns are **perfectly correct** while decimals and
+dates are wrong. `Quantity` (37,873), `Postal Code`, `City` (531 distinct) all matched exactly. A
+partial-correctness pattern like that is a *parsing* fault, never a *binding* fault.
+
+**⚠️ Adding `Table.TransformColumnTypes(..., "en-US")` changes NOTHING — but NOT because culture is
+out of reach.** [corrected 2026-08-09 by `book_6-1-Maps`; the original text here asserted M never sees
+the source text, which is false and contradicted §3 of this same file.] The measurement is sound —
+`"en-US"` was confirmed live via `INFO.PARTITIONS()` and produced byte-identical corrupt output, and
+`delayTypes = false` likewise. **The interpretation was wrong.** `"en-US"` is already the *effective*
+parse culture, so pinning it is a no-op; the experiment shows the value is wrong, not that the knob is
+disconnected.
+
+The original reasoning — *"an `en-US` parse of `"261.96"` can only ever yield `261.96`"* — substitutes
+the wrong string. **M never receives `"261.96"`; it receives `"261,96"`** (§3: the reader emits text in
+the **OS user locale**, not `Culture.Current`). An `en-US` parse of `"261,96"` reads the comma as a
+*group* separator and yields exactly `26196`. M *does* see the original text, and a culture argument
+*can* reach it.
+
+**Reproduced deterministically** (`book_6-1-Maps`, from the same `.xls` via `xlrd`): render each value
+at **4 decimal places** in a comma-decimal locale, strip the separator, and you get
+`SUM(Sales) = 1,131,591,720` and `SUM(Profit) = 1,799,876,538` — **digit-for-digit the values measured
+live in `4-dashboards`.** The 4-dp rendering is why the multiplier is not a constant ×100: it is
+10^(decimals), so the aggregate ratio differs per column (Sales ≈ 493×, Profit ≈ 6,285×). An arbitrary,
+per-column inflation ratio is the fingerprint of this bug.
+
+**So `nl-BE` genuinely does fix it** (independently shipped by `book_5-2-LOD`, 75/75 oracle checks) —
+but **do not adopt it**: the correct culture is whatever locale the *build host* renders in, so a
+culture pin bakes the build machine into the artifact and corrupts on the next machine. That, not
+unreachability, is the reason to prefer the CSV path below.
+
+**Fix: take the legacy `.xls` reader out of the path.** Re-land the sheet as an invariant-format CSV
+(ISO `yyyy-MM-dd` dates, `.` decimals — both parse identically in every culture) and read it with
+`Csv.Document`; keep an explicit culture on the type step. Do this from a re-runnable `_build/`
+script so the bundle can be rebuilt. Post-fix the model matched the source **exactly** (9,994 rows,
+`SUM(Sales) = 2,297,200.86`, `SUM(Profit) = 286,397.02`, dates `2015-01-03..2018-12-30`, zero blanks).
+Do **not** reach for an OS-level `Set-Culture`: that is an account-wide change outside the repo's
+scope (§3) — and it is unnecessary, because the CSV path is locale-proof by construction.
+
+**Always ground-truth a file-based extract against the file itself.** Read the source directly
+(`xlrd` for BIFF8 — it decodes stored cell types natively and correctly) and compare a handful of
+totals plus min/max dates. `EVALUATE TOPN(1, …)` returning a row proves binding, **not** values; here
+the very first probe row already showed `Order_Date = None` and it would have been easy to dismiss as
+a formatting artifact of the probe's printer.
+
+**This is machine-wide, so check your siblings.** All four bundles on this machine read the same
+`.xls` the same way, so all four carry the same corruption. Report it to the orchestrator rather than
+editing another agent's model — but do report it, because nothing downstream will catch it.
+
+### ⚠️ The modeling MCP can serve a DIFFERENT model than the port you asked for
+
+Measured 2026-08-08, same session. `connection_operations Connect` with
+`Data Source=localhost:53583` reported success and even named the connection
+`PBIDesktop-book_8-1-Dashboards-53583`, with `GetConnection` echoing back the correct server *and*
+the correct catalog GUID. It then answered queries from a **different model**: `INFO.TABLES()`
+returned four tables including a `_ProbeSheets` table that exists in no bundle here, `Orders` had 24
+columns (the TMDL declares 22) including calculated columns belonging to a *sibling* migration, and
+`COUNTROWS('Orders')` returned **0 rows** while `'Date'` returned 366 — against a model that a
+pid-scoped ADOMD probe showed had 9,994 rows on that same port at that same moment.
+
+**So the MCP's own connection metadata cannot be used to prove identity.** Cross-check it against
+something the model itself must satisfy — the table list and column count from your TMDL — before
+trusting a single number it returns. When they disagree, prefer the **pid-scoped** path
+(`probe_desktop_query.py`'s `_child_port(pid)`, which walks Desktop→child `msmdsrv` and never widens
+the lookup). A wrong-model read is far more dangerous than a failed read: it returns confident,
+plausible numbers about somebody else's data.
+## 7. Legacy `.xls` navigation keys, and Desktop sessions that turn errors into hangs
+
+Measured 2026-08-08 (`book_6-1-Maps`, same Superstore BIFF8 `.xls` and same en-BE machine as §6).
+Three defects that cost a full debugging cycle each, none of which §6 covers.
+
+### 7.1 The emitted navigation key is XLSX-shaped and can never match a legacy `.xls`
+
+The engine emits the navigation record Power Query uses for a **modern `.xlsx`**:
+
+```
+Navigation = Source{[Item="Orders", Kind="Sheet"]}[Data]      -- fails on a legacy .xls
+```
+
+`Excel.Workbook` returns a navigation table whose **columns differ by file format**. For `.xlsx` it
+has `Name / Data / Item / Kind / Hidden`; for a legacy BIFF8 `.xls` it has **only `Name` and
+`Data`**. A record key naming a column that does not exist can never match, so the refresh fails:
+
+```
+[Expression.Error] The key didn't match any rows in the table.
+```
+
+The correct legacy form is Name-keyed: `Source{[Name="Orders"]}[Data]`.
+
+**Do not guess the item spelling — enumerate it.** A plausible-looking guess (`Item="Orders$"`, the
+`$` borrowed from ACE OLEDB's *table* naming convention) fails **identically**, because `Orders$` is
+a different surface and appears nowhere in the navigation table. Both spellings produce the same
+error, so a failed guess looks exactly like a correct one. Settle it with a throwaway probe table
+whose M cannot fail on schema:
+
+```
+let
+    Source = Excel.Workbook(File.Contents("...xls"), null, true),
+    Line   = "COLUMNS: " & Text.Combine(Table.ColumnNames(Source), " ,"),
+    Names  = List.Transform(Table.Column(Source, "Name"), each "Name=" & Text.From(_)),
+    T      = Table.FromList(List.Combine({{Line}, Names}), Splitter.SplitByNothing(), {"Info"})
+in  T
+```
+
+It returns the column list *and* every sheet name in one refresh (`COLUMNS: Name ,Data` /
+`Name=Orders` / …), which is a fact rather than a hypothesis. Delete the probe afterwards.
+
+### 7.2 Editing TMDL while Desktop has the `.pbip` open corrupts the session — and every later refresh HANGS
+
+**The live model keeps serving the PRE-EDIT M.** Desktop loads the model into its child `msmdsrv`
+at open; editing `definition/*.tmdl` on disk afterwards does **not** reload it. So an on-disk fix
+appears to do nothing, and gets misdiagnosed as "the fix didn't work". Verify what is actually
+running, never what is on disk:
+
+```
+SELECT [Name],[State],[QueryDefinition] FROM $SYSTEM.TMSCHEMA_PARTITIONS
+```
+
+**Worse, the edit can invalidate Desktop's package session**, which raises a modal:
+
+> **Something went wrong** — `Could not find a PackageSession for the given sessionID.`
+
+Once that modal is up, **every XMLA refresh blocks indefinitely instead of returning an error**
+(observed >330 s, mistaken for a slow refresh — the same "a hang is a modal waiting on a human"
+shape as §5, with no credential anywhere in sight; this source was a local file). The error that
+*would* have been returned is never delivered, so a genuinely broken M reads as a timeout.
+
+**Rules.** Close Desktop **before** editing TMDL, then reopen. **Do not use a graceful close here:**
+it prompts to save, and saving writes the **stale in-memory model back over the corrected TMDL**,
+silently undoing your fix. For an instance *you opened yourself to refresh a model you are editing on
+disk*, a **force-kill** (`Stop-Process -Id <literal pid> -Force`) is the right close **once you have
+confirmed there is no unsaved in-memory state worth keeping** (the cleanliness gate below); it also
+discards live-only MCP *probe* objects (disposable scratch tables) as a free cleanup.
+
+⚠️ **Authorise a force-kill by a positive cleanliness check, not by provenance.** Knowing you opened
+the instance, and that `currentFilePath` is your `.pbip`, identifies *which* instance you hold — it
+does **not** prove it is clean; an instance you opened can still accumulate unsaved changes. Read the
+per-instance **`hasUnsavedChanges`** flag that `powerbi-desktop status` returns next to
+`currentFilePath`:
+- **`hasUnsavedChanges: false`** — the in-memory model holds nothing the disk lacks; force-kill is
+  safe and your corrected TMDL loads on reopen. (Normal case: editing TMDL *on disk* does not dirty
+  the Desktop document, it only makes the in-memory copy stale.)
+- **`hasUnsavedChanges: true`** — unsaved in-memory state exists; do **not** force-kill on provenance
+  alone, and do **not** scope the question to work *you did not create* — what matters is whether
+  unsaved state exists, not whose it is. Force-kill only if you can *positively confirm* every unsaved
+  change is already reproducible on disk (re-running this cycle's `_build/` script, and/or an
+  `ExportToTmdlFolder` you have already run, rebuilds it exactly). Otherwise **stop and ask** whether
+  to save/export or discard.
+
+**The realistic source of unsaved work you authored yourself is the modeling MCP:** it writes
+tables/measures/relationships **directly into the live Desktop model**, where they exist only in
+memory (and read as `hasUnsavedChanges: true`) until `database_operations ExportToTmdlFolder`
+persists them to the on-disk TMDL — a force-kill silently destroys any you have not exported. Mind
+the interaction with the graceful-close hazard above: here the on-disk TMDL is the *corrected* copy
+and the live model is *stale*, so neither a save nor an export can rescue in-memory work without
+overwriting your fix; if you genuinely hold both an on-disk correction and unexported in-memory
+changes you need, that is a real conflict — **stop and ask.** Never force-kill a sibling build's
+instance (the pid-binding rule).
+
+### 7.3 Scan for ALL modal windows, not just credential phrases
+
+§5's UIA recipe filters descendant names to sign-in wording (`signed in|Personal Access|…`). That
+filter **misses any other modal**, and any modal blocks refresh just as effectively. Here a
+`Bing map visuals are going away` deprecation dialog — shown on **every open** of a report
+containing Bing map visuals, so it recurs on every automated cycle — silently blocked the refresh,
+and a credential-filtered scan reported "no modal found".
+
+So **enumerate every child window and REPORT whether it is modal** (detect on `IsModal`, not on
+text) — but **do not blanket-close them.** A modal can be a save prompt, an error dialog, an upgrade
+nag, a security warning or a **credential/sign-in prompt**, and dismissing the wrong one destroys
+work or silently defeats the stop-and-ask rule this bundle enforces elsewhere (§5: a missing
+credential goes to a human, it is never worked around). Close only modals on an **explicit allowlist
+of known, side-effect-free nuisance dialogs** — the `Bing map visuals are going away` deprecation
+dialog is the canonical entry. **A credential/sign-in modal is NEVER auto-dismissed** — closing it
+does not supply the credential, it just turns a recoverable stop-and-ask into a silent empty refresh;
+surface the exact data source and escalate, exactly as §5 requires. Anything else not on the
+allowlist: report it and leave it open for the caller to decide.
+
+```powershell
+# Auto-close ONLY these known, side-effect-free nuisance dialogs (they recur every cycle):
+$modalAllowlist  = 'Bing map visuals are going away'
+# Wording that marks a credential/sign-in modal - NEVER auto-close; escalate to a human (see §5):
+$credentialModal = 'signed in|Personal Access|Sign in|credential|account|password'
+
+$wcond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Window)
+foreach ($d in $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $wcond)) {
+    $wp   = $d.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+    $name = $d.Current.Name
+    if (-not $wp.Current.IsModal) { continue }
+    "MODAL: $name"                                     # always REPORT every modal found
+    if ($name -match $credentialModal) {
+        "  -> credential/sign-in modal: DO NOT close - escalate to a human (see §5)"; continue
+    }
+    if ($name -match $modalAllowlist) {
+        $wp.Close()                                    # WindowPattern.Close beats clicking a button
+        "  -> closed (allowlisted nuisance dialog)"
+    } else {
+        "  -> not on allowlist: left open, reporting it for the caller to decide"
+    }
+}
+```
+
+Dismiss via `WindowPattern.Close()` on the `WindowsForms10.*` host — invoking the WebView's own
+`Close Dialog` button is unreliable. **Never** click an action button you did not intend
+(`Upgrade to Azure Maps` would rewrite the report layer, which belongs to `pbi-report-builder`).
+
+**Corollary — an idle `msmdsrv` is diagnostic.** During the "hang", the child `msmdsrv` had
+accumulated only ~16 s CPU over an hour. A blocked-on-modal refresh is *idle*, not busy; a genuinely
+slow refresh burns CPU. Check that before assuming you need to wait longer.

@@ -9,8 +9,8 @@ equally to a Tableau, Qlik or Cognos migration.
 ## Install
 
 ```
-/plugin marketplace add Guust-Franssens/powerbi-migration-skills
-/plugin install powerbi-migration-skills@powerbi-migration-collection
+/plugin marketplace add Guust-Franssens/powerbi-playbook
+/plugin install powerbi-playbook@powerbi-playbook-collection
 ```
 
 ## What's included

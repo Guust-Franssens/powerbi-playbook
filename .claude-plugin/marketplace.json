@@ -1,26 +1,25 @@
 {
-  "name": "powerbi-migration-collection",
+  "name": "powerbi-playbook-collection",
   "metadata": {
     "description": "Reusable Power BI semantic-model skills for GitHub Copilot CLI",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "owner": {
     "name": "Guust Franssens"
   },
   "plugins": [
     {
-      "name": "powerbi-migration-skills",
-      "source": "./plugins/powerbi-migration-skills",
+      "name": "powerbi-playbook",
+      "source": "./plugins/powerbi-playbook",
       "description": "Reusable Power BI skills: make a semantic model AI-ready, persist a refreshed local PBIP, and avoid the PBIR and TMDL defects that pass validation but break at open, refresh or render. Covers descriptions, enumerated domains, model-level AI instructions (CustomInstructions) and the qnaEnabled switch that silently voids them; refreshing a PBIP in Power BI Desktop and saving it headlessly to cache.abf via AMO ImageSave; and two hard-won gotcha catalogues for report authoring and semantic modelling. Source-tool agnostic - the input is already a Power BI model - so it applies to Tableau, Qlik and Cognos migrations alike.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "skills": [
         "./skills/powerbi-ai-readiness",
-        "./skills/pbip-model-refresh",
         "./skills/powerbi-report-gotchas",
         "./skills/powerbi-semantic-model-gotchas"
       ],
       "agents": [],
-      "repository": "https://github.com/Guust-Franssens/powerbi-migration-skills",
+      "repository": "https://github.com/Guust-Franssens/powerbi-playbook",
       "keywords": [
         "powerbi",
         "power-bi",
