@@ -1,7 +1,7 @@
 {
   "name": "powerbi-playbook-collection",
   "metadata": {
-    "description": "Reusable Power BI semantic-model skills for GitHub Copilot CLI",
+    "description": "Reusable Power BI semantic-model skills for GitHub Copilot CLI and Claude Code",
     "version": "0.3.0"
   },
   "owner": {

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "powerbi-playbook",
+  "description": "Reusable Power BI skills: make a semantic model AI-ready, and avoid the PBIR and TMDL defects that pass validation but break at open, refresh or render. Covers descriptions, enumerated domains, model-level AI instructions (CustomInstructions) and the qnaEnabled switch that silently voids them; plus two hard-won gotcha catalogues for report authoring and semantic modelling, each entry paid for by a real debugging cycle on a real migration. Source-tool agnostic - the input is already a Power BI model - so it applies to Tableau, Qlik and Cognos migrations alike.",
+  "version": "0.3.0",
+  "license": "MIT",
+  "repository": "https://github.com/Guust-Franssens/powerbi-playbook",
+  "keywords": [
+    "powerbi",
+    "power-bi",
+    "semantic-model",
+    "tmdl",
+    "pbip",
+    "copilot",
+    "ai-readiness",
+    "migration",
+    "tableau",
+    "fabric"
+  ],
+  "skills": [
+    "./skills/powerbi-ai-readiness",
+    "./skills/powerbi-report-gotchas",
+    "./skills/powerbi-semantic-model-gotchas"
+  ],
+  "agents": []
+}
