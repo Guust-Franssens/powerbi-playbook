@@ -1,11 +1,15 @@
 # Power BI Playbook
 
-Reusable skills for **GitHub Copilot CLI** and **Claude Code** that get a Power BI semantic model
-production-ready: making it answer natural-language questions correctly, and avoiding the PBIR and
-TMDL defects that pass every validator and then break at open, refresh or render.
+Skills for **GitHub Copilot CLI** and **Claude Code**: portable Power BI AI-readiness policy and
+two compact **Tableau-migration host contracts**, not generic PBIR/TMDL encyclopedias.
 
-Every skill is **source-tool agnostic** — the input is already a Power BI model — so they apply
-equally to a Tableau, Qlik or Cognos migration, and to greenfield Power BI work.
+The AI skill can be used with an existing Power BI model regardless of source tool. The report and
+semantic cores preserve Tableau source intent, shipped-artifact identity and evidence-bounded
+handoffs; they are **not greenfield authoring guides**. General procedures belong to separately
+installed upstream `powerbi-report-cli` and `semantic-model-authoring`, in the selected mode/topic.
+The host repository supplies migration scripts/docs, refresh/persistence, live-source proof and
+declarations; those operations are **not bundled**. Missing required owners block only their affected
+operation, never permission to improvise. Optional pinned history is evidence, not a procedure.
 
 ## Install
 
@@ -19,8 +23,8 @@ equally to a Tableau, Qlik or Cognos migration, and to greenfield Power BI work.
 | Skill | Use it for |
 |---|---|
 | `powerbi-ai-readiness` | Descriptions, enumerated categorical domains, model-level AI instructions (`CustomInstructions`), and the `qnaEnabled` switch that silently voids all of it |
-| `powerbi-report-gotchas` | PBIR authoring and Desktop verification: defects that pass `validate` but render wrong, conditional-formatting encodings, azureMap/scatter/matrix recipes |
-| `powerbi-semantic-model-gotchas` | TMDL and DAX pitfalls that crash Desktop on open, fail to bind, or throw only at query time - each one paid for by a real debugging cycle |
+| `powerbi-report-gotchas` | Tableau-migration report core: source grain/defaults, shipped-model binding, replay/declaration and layer handoff; requires host owners |
+| `powerbi-semantic-model-gotchas` | Tableau-migration semantic core: source calculations, request roles, visual grain, current-model proof and handoff; requires host owners |
 
 ## Why a plugin and not a repo-local skill
 
@@ -47,8 +51,10 @@ its audience cannot install, with nothing in the build output to show for it.
 ## Source
 
 Generated from [Guust-Franssens/tableau-to-powerbi-migration](https://github.com/Guust-Franssens/tableau-to-powerbi-migration) by `scripts/build_plugin.py`.
-Each skill folder is self-contained — `SKILL.md` plus its own `scripts/` and `tests/` — and the
-source repo's CI proves that by copying the folder to a temp directory and running its tests there
-with the source repo unimportable.
+The AI bundle carries its own scripts/tests; CI copies code-bearing bundles into an isolated
+directory and runs their tests with the source repo unimportable. The two migration cores are
+knowledge-only `SKILL.md` files: copying them does **not** copy their host-repository dependencies.
+Resolve the owners named by the selected core before its dependent operation. Static checks do not
+prove fresh-role resolution, live data, render fidelity or durable cold reopen.
 
 Do not edit these files here; edit them in the source repo and re-publish.

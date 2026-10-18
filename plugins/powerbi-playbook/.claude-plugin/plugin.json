@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "powerbi-playbook",
-  "description": "Reusable Power BI skills: make a semantic model AI-ready, and avoid the PBIR and TMDL defects that pass validation but break at open, refresh or render. Covers descriptions, enumerated domains, model-level AI instructions (CustomInstructions) and the qnaEnabled switch that silently voids them; plus two hard-won gotcha catalogues for report authoring and semantic modelling, each entry paid for by a real debugging cycle on a real migration. Source-tool agnostic - the input is already a Power BI model - so it applies to Tableau, Qlik and Cognos migrations alike.",
-  "version": "0.3.0",
+  "description": "Power BI AI readiness plus compact Tableau-migration report/model contracts. The AI skill owns descriptions, categorical domains, CustomInstructions and qnaEnabled. The migration cores preserve source intent, shipped-model binding, layer handoffs and evidence limits; they are not generic or greenfield authoring guides. General procedures require separately installed upstream skills; migration tooling, refresh/persistence and live-source proof require the host repository and are not bundled. Missing owners block affected operations.",
+  "version": "0.3.2",
   "license": "MIT",
   "repository": "https://github.com/Guust-Franssens/powerbi-playbook",
   "keywords": [
